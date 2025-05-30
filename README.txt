@@ -12,3 +12,8 @@ Contains:
 
 
 Every C project I work on invariably ends up using two or more of the above projects. To make it easier to maintain and use, I merged them into a single header file. My own standard library of sorts.
+
+
+How to use:
+#define BASE_IMPLEMENTATION // Only do this once. Subsequent includes does not need this.
+#include "base.h"
