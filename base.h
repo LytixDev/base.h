@@ -629,6 +629,7 @@ TP_TaskInfo tp_get_info(TP_ThreadPool *tp, TP_TaskHandle handle, bool remove_if_
  * Implementation
  *
  */
+#define BASE_IMPLEMENTATION
 #if defined(BASE_IMPLEMENTATION) && !defined(BASE_IMPLEMENTATION_INCLUDED)
 #define BASE_IMPLEMENTATION_INCLUDED
 
@@ -949,8 +950,11 @@ static void re_insert(u32 size_log2, struct hm_bucket_t *buckets, struct hm_entr
     insert(&buckets[idx], entry);
 }
 
+int increased_map = 0;
+
 static void increase(struct hashmap_t *map)
 {
+    increased_map++;
     // TODO: instead of moving all entries in one go, we can only move over some
     // buckets
     //       and invalidate the rest and move them once necesary
@@ -991,8 +995,9 @@ void hashmap_put(struct hashmap_t *map, void *key, u32 key_size, void *value, u3
 {
     double load_factor = (double)map->len / (N_BUCKETS(map->size_log2) * HM_BUCKET_SIZE);
 
-    if (load_factor >= 0.75)
-	increase(map);
+    if (load_factor >= 0.75) {
+	    increase(map);
+    }
 
     u32 hash = hash_func_m(key, key_size);
     u32 idx = hash >> (32 - map->size_log2);
@@ -1001,8 +1006,8 @@ void hashmap_put(struct hashmap_t *map, void *key, u32 key_size, void *value, u3
     int rc = insert(&map->buckets[idx], &new);
 
     if (rc == _HM_FULL) {
-	increase(map);
-	hashmap_put(map, key, key_size, value, val_size, alloc_flag);
+        increase(map);
+        hashmap_put(map, key, key_size, value, val_size, alloc_flag);
     }
 
     if (rc == _HM_SUCCESS)
