@@ -33,10 +33,16 @@ typedef struct strmap_result_t {
     u64 value;
 } StrMapResult;
 
+typedef struct strmap_entry_t {
+    Str8 key;
+    u64 value;
+} StrMapEntry;
+
 typedef struct strmap_bucket_t {
     // NOTE: Nothing here is _owned_. The lifetime of the underlying keys and values is not managed.
     Str8 keys[SM_BUCKET_LEN];
     u64 values[SM_BUCKET_LEN];
+    //StrMapEntry entries[SM_BUCKET_LEN];
 } StrMapBucket;
 
 typedef struct strmap_t {
@@ -95,6 +101,19 @@ static u32 str8_hash(Str8 str)
     return k * A;
 }
 
+static bool str8_eq(Str8 a, Str8 b)
+{
+    if (a.len != b.len) {
+        return false;
+    }
+    for (size_t i = 0; i < a.len; i++) {
+        if (a.str[i] != b.str[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static StrMapInsertionResult bucket_insert(StrMapBucket *bucket, Str8 key, u64 value, u32 hash)
 {
 
@@ -106,7 +125,7 @@ static StrMapInsertionResult bucket_insert(StrMapBucket *bucket, Str8 key, u64 v
         if (entry_key.str == NULL) {
             found = i;
         }
-        if (entry_key.str != NULL && STR8_EQUAL(key, entry_key)) {
+        if (entry_key.str != NULL && str8_eq(key, entry_key)) {
             bucket->values[i] = value;
             return INSERTION_OVERRIDE;
         }
@@ -189,7 +208,7 @@ StrMapResult strmap_get(StrMap *map, Str8 key)
     StrMapBucket bucket = map->buckets[idx];
     for (u64 i = 0; i < SM_BUCKET_LEN; i++) {
         Str8 entry_key = bucket.keys[i];
-        if (entry_key.str != NULL && STR8_EQUAL(key, entry_key)) {
+        if (entry_key.str != NULL && str8_eq(key, entry_key)) {
             return (StrMapResult){ .ok = true, .value = bucket.values[i] };
         }
     }
