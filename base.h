@@ -29,6 +29,7 @@
  * -> log: Logging. Also yoinked from the metagen project.
  * -> nag: Nicolai's Amazing Graph library for directed graphs.
  * -> threadpool (tp)
+ * -> StrMap: The HashMap implementation but specifically for Str8 keys and u64 values.
  * 
  * 
  * Every C project I work on invariably ends up using two or more of the above projects. To make it 
@@ -92,6 +93,10 @@ typedef double f64;
 #define ARRAY_LENGTH(arr) (size_t)(sizeof(arr) / sizeof((arr)[0]))
 
 #define IS_BETWEEN(x, lower, upper) (((lower) <= (x)) && ((x) <= (upper)))
+
+#define __STR1(x) #x
+#define __STR(x) __STR1(x)
+#define PLEASE_UNROLL(N) _Pragma(__STR(GCC unroll N))
 
 // TODO: we assume NULL is 0x0 in many places. This holds true for every compiler I've ever seen,
 //       but its not guaranteed. So we should give an error if we detect it is in fact not 0.
@@ -442,6 +447,62 @@ u32 str_list_push_cstr(Arena *arena, Str8List *list, char *cstr);
 void str_list_print(Str8List *list);
 /* The individual strings in the list will be Str8Views into the original Str8 input ! */
 Str8List str_list_from_split(Str8 input, char delim);
+
+/* 
+ * strmap: the hashmap implementation but specifically for str8 keys and u64 values
+ */
+#define SM_STARTING_BUCKETS_LOG2 3 // the amount of starting buckets
+#define SM_BUCKET_LEN 8
+#define SM_LOAD_FACTOR_PERCENT 80
+#define SM_N_BUCKETS(log2) (1 << (log2))
+
+typedef enum {
+    INSERTION_FULL,
+    INSERTION_OVERRIDE,
+    INSERTION_SUCCESS,
+} StrMapInsertionResult;
+
+typedef struct strmap_result_t {
+    bool ok;
+    u64 value;
+} StrMapResult;
+
+typedef struct strmap_entry_t {
+    Str8 key;
+    u64 value;
+} StrMapEntry;
+
+typedef struct strmap_bucket_t {
+    // NOTE: Nothing here is _owned_. The lifetime of the underlying keys and values is not managed.
+    //Str8 keys[SM_BUCKET_LEN];
+    //u64 values[SM_BUCKET_LEN];
+    StrMapEntry entries[SM_BUCKET_LEN];
+} StrMapBucket;
+
+typedef struct strmap_t {
+    StrMapBucket *buckets;
+    u32 buckets_log2; // we store 2**buckets_log2 number of buckets
+    u32 len; // total items stored in the map
+} StrMap;
+
+typedef struct strmap_iter_t {
+    StrMap *map;
+    u32 bucket_idx;
+    u32 entry_idx;
+} StrMapIter;
+
+// Can modify the value in-place
+typedef bool (*StrMapRetainFn)(Str8 key, u64 *value, void *userdata);
+
+void strmap_init(StrMap *map, u32 starting_buckets_log2);
+void strmap_free(StrMap *map);
+void strmap_put(StrMap *map, Str8 key, u64 value);
+StrMapResult strmap_get(StrMap *map, Str8 key);
+bool strmap_rm(StrMap *map, Str8 key);
+void strmap_clear(StrMap *map);
+void strmap_retain(StrMap *map, StrMapRetainFn predicate, void *userdata);
+StrMapIter strmap_iter(StrMap *map);
+StrMapEntry* strmap_iter_next(StrMapIter *iter);
 
 /* 
  * Originally from log.h 
@@ -949,8 +1010,11 @@ static void re_insert(u32 size_log2, struct hm_bucket_t *buckets, struct hm_entr
     insert(&buckets[idx], entry);
 }
 
+int increased_map = 0;
+
 static void increase(struct hashmap_t *map)
 {
+    increased_map++;
     // TODO: instead of moving all entries in one go, we can only move over some
     // buckets
     //       and invalidate the rest and move them once necesary
@@ -991,8 +1055,9 @@ void hashmap_put(struct hashmap_t *map, void *key, u32 key_size, void *value, u3
 {
     double load_factor = (double)map->len / (N_BUCKETS(map->size_log2) * HM_BUCKET_SIZE);
 
-    if (load_factor >= 0.75)
-	increase(map);
+    if (load_factor >= 0.75) {
+	    increase(map);
+    }
 
     u32 hash = hash_func_m(key, key_size);
     u32 idx = hash >> (32 - map->size_log2);
@@ -1001,8 +1066,8 @@ void hashmap_put(struct hashmap_t *map, void *key, u32 key_size, void *value, u3
     int rc = insert(&map->buckets[idx], &new);
 
     if (rc == _HM_FULL) {
-	increase(map);
-	hashmap_put(map, key, key_size, value, val_size, alloc_flag);
+        increase(map);
+        hashmap_put(map, key, key_size, value, val_size, alloc_flag);
     }
 
     if (rc == _HM_SUCCESS)
@@ -1675,6 +1740,228 @@ Str8List str_list_from_split(Str8 input, char delim)
         }
     }
     return list;
+}
+
+/*
+ * StrMap implementation
+ */
+void strmap_init(StrMap *map, u32 starting_buckets_log2)
+{
+    map->len = 0;
+    map->buckets_log2 = starting_buckets_log2;
+
+    u64 n_buckets = SM_N_BUCKETS(map->buckets_log2);
+    map->buckets = malloc(n_buckets * sizeof(StrMapBucket));
+
+    for (u64 i = 0; i < n_buckets; i++) {
+        StrMapBucket *bucket = &map->buckets[i];
+
+        PLEASE_UNROLL(SM_BUCKET_LEN)
+        for (u64 j = 0; j < SM_BUCKET_LEN; j++) {
+            bucket->entries[j].key.str = NULL;
+        }
+    }
+}
+
+void strmap_free(StrMap *map)
+{
+    free(map->buckets);
+}
+
+static u32 str8_hash(Str8 str)
+{
+    /* gigahafting kok (legger dermed ikke så mye lit til det) */
+    u32 A = 1327217885;
+    u32 k = 0;
+
+    // TODO: instead of reading byte for byte we can read 64 bytes at a time
+    for (size_t i = 0; i < str.len; i++) {
+	    k += (k << 5) + ((u8 *)str.str)[i];
+    }
+
+    return k * A;
+}
+
+static bool str8_eq(Str8 a, Str8 b)
+{
+    if (a.len != b.len) {
+        return false;
+    }
+    for (size_t i = 0; i < a.len; i++) {
+        if (a.str[i] != b.str[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static StrMapInsertionResult bucket_insert(StrMapBucket *bucket, Str8 key, u64 value, u32 hash)
+{
+
+    /* Must check each entry in case the key is already stored */
+    s64 found = -1;
+
+    for (u64 i = 0; i < SM_BUCKET_LEN; i++) {
+        Str8 entry_key = bucket->entries[i].key;
+        if (entry_key.str == NULL) {
+            found = i;
+        }
+        if (entry_key.str != NULL && str8_eq(key, entry_key)) {
+            bucket->entries[i].value = value;
+            return INSERTION_OVERRIDE;
+        }
+    }
+
+    if (found == -1) {
+        return INSERTION_FULL;
+    }
+    
+    bucket->entries[found].key = key;
+    bucket->entries[found].value = value;
+    return INSERTION_SUCCESS;
+}
+
+static void strmap_increase(StrMap *map)
+{
+    map->buckets_log2++;
+    assert(map->buckets_log2 < 32);
+
+    u64 old_n_buckets = N_BUCKETS(map->buckets_log2 - 1);
+    u64 n_buckets = N_BUCKETS(map->buckets_log2);
+    StrMapBucket *new_buckets = malloc(n_buckets * sizeof(StrMapBucket));
+    /* Init the new buckets */
+    for (u64 i = 0; i < n_buckets; i++) {
+        StrMapBucket *bucket = &new_buckets[i];
+
+        PLEASE_UNROLL(SM_BUCKET_LEN)
+        for (u64 j = 0; j < SM_BUCKET_LEN; j++) {
+            bucket->entries[j].key.str = NULL;
+        }
+    }
+
+    /* Move all entries to the new buckets */
+    // TODO: what if we get a collision here
+    for (u64 i = 0; i < old_n_buckets; i++) {
+        StrMapBucket *bucket = &map->buckets[i];
+        for (u64 j = 0; j < SM_BUCKET_LEN; j++) {
+            Str8 entry_key = bucket->entries[j].key;
+            if (entry_key.str != NULL) {
+                u32 hash = str8_hash(entry_key);
+                u32 idx = hash >> (32 - map->buckets_log2);
+                bucket_insert(&new_buckets[idx], entry_key, bucket->entries[j].value, hash);
+            }
+        }
+    }
+
+    free(map->buckets);
+    map->buckets = new_buckets;
+}
+
+void strmap_put(StrMap *map, Str8 key, u64 value)
+{
+    // Stolen from map.jai
+    // Without dividing, we want to test:
+    //    (filled / allocated >= 70/100)
+    // Therefore, we say
+    //    (filled * 100 >= allocated * 70)
+    u64 entries_allocated = N_BUCKETS(map->buckets_log2) * SM_BUCKET_LEN;
+    if ((map->len + 1) * 100 >= entries_allocated * SM_LOAD_FACTOR_PERCENT) {
+        strmap_increase(map);
+    }
+
+    u32 hash = str8_hash(key);
+    u32 idx = hash >> (32 - map->buckets_log2);
+    StrMapInsertionResult rc = bucket_insert(&map->buckets[idx], key, value, hash);
+    if (rc == INSERTION_FULL) {
+        strmap_increase(map);
+        strmap_put(map, key, value);
+    }
+
+    if (rc == INSERTION_SUCCESS) {
+        map->len++;
+    }
+}
+
+StrMapResult strmap_get(StrMap *map, Str8 key)
+{
+    u32 hash = str8_hash(key);
+    u32 idx = hash >> (32 - map->buckets_log2);
+    StrMapBucket bucket = map->buckets[idx];
+    for (u64 i = 0; i < SM_BUCKET_LEN; i++) {
+        Str8 entry_key = bucket.entries[i].key;
+        if (entry_key.str != NULL && str8_eq(key, entry_key)) {
+            return (StrMapResult){ .ok = true, .value = bucket.entries[i].value };
+        }
+    }
+
+    return (StrMapResult){ .ok = false };
+}
+
+bool strmap_rm(StrMap *map, Str8 key)
+{
+    u32 hash = str8_hash(key);
+    u32 idx = hash >> (32 - map->buckets_log2);
+    StrMapBucket *bucket = &map->buckets[idx];
+
+    for (u64 i = 0; i < SM_BUCKET_LEN; i++) {
+        Str8 entry_key = bucket->entries[i].key;
+        if (entry_key.str != NULL && str8_eq(key, entry_key)) {
+            bucket->entries[i].key.str = NULL;
+            map->len--;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void strmap_clear(StrMap *map)
+{
+    u64 n_buckets = SM_N_BUCKETS(map->buckets_log2);
+    for (u64 i = 0; i < n_buckets; i++) {
+        StrMapBucket *bucket = &map->buckets[i];
+        for (u64 j = 0; j < SM_BUCKET_LEN; j++) {
+            bucket->entries[j].key.str = NULL;
+        }
+    }
+    map->len = 0;
+}
+
+void strmap_retain(StrMap *map, StrMapRetainFn predicate, void *userdata)
+{
+    StrMapIter iter = strmap_iter(map);
+    StrMapEntry *entry;
+    while ((entry = strmap_iter_next(&iter)) != NULL) {
+        if (!predicate(entry->key, &entry->value, userdata)) {
+            entry->key.str = NULL;
+            map->len--;
+        }
+    }
+}
+
+StrMapIter strmap_iter(StrMap *map)
+{
+    return (StrMapIter){ .map = map, .bucket_idx = 0, .entry_idx = 0 };
+}
+
+StrMapEntry *strmap_iter_next(StrMapIter *iter)
+{
+    u64 n_buckets = SM_N_BUCKETS(iter->map->buckets_log2);
+
+    while (iter->bucket_idx < n_buckets) {
+        while (iter->entry_idx < SM_BUCKET_LEN) {
+            StrMapEntry *entry = &iter->map->buckets[iter->bucket_idx].entries[iter->entry_idx];
+            iter->entry_idx++;
+            if (entry->key.str != NULL) {
+                return entry;
+            }
+        }
+        /* Next bucket */
+        iter->bucket_idx++;
+        iter->entry_idx = 0;
+    }
+
+    return NULL;
 }
 
 /* 
